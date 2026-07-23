@@ -13,8 +13,36 @@ import { Project, Type, Node, ts } from "ts-morph";
 import * as fs from "node:fs";
 
 // ---------------------------------------------------------------------------
-// 1. Args: positionals = [file, ...typeNames]; flags = --out --own --tsconfig --depth
+// 1. Command-line arguments
 // ---------------------------------------------------------------------------
+
+/**
+ * Minimal argv parser — no external dependency (no commander/yargs).
+ *
+ * Splits raw argv into two buckets:
+ *
+ * - **positionals** — bare words. The first is the source file, the rest are
+ *   type names: `[file, ...typeNames]`.
+ * - **flags** — `--name value` pairs, or `--name` alone for booleans. A flag
+ *   followed by another `--flag` (or nothing) is treated as `true`.
+ *
+ * A lone `--` separator is skipped, so `npm run props -- src/types.ts Foo`
+ * works: npm forwards everything after `--`, and any stray `--` is ignored.
+ *
+ * Note: values are **not** type-coerced. Numeric flags come back as strings and
+ * are converted at the call site (e.g. `Number(flags.depth)`).
+ *
+ * @param argv - Argument list, normally `process.argv.slice(2)`.
+ * @returns `positionals` in the order given, and `flags` keyed without the
+ *          leading `--` (so `--include-dom` becomes `flags["include-dom"]`).
+ *
+ * @example
+ * parseArgs(["src/types.ts", "ButtonProps", "--own", "--depth", "4"]);
+ * // => {
+ * //      positionals: ["src/types.ts", "ButtonProps"],
+ * //      flags: { own: true, depth: "4" }
+ * //    }
+ */
 function parseArgs(argv: string[]) {
   const positionals: string[] = [];
   const flags: Record<string, string | boolean> = {};
@@ -32,23 +60,172 @@ function parseArgs(argv: string[]) {
 }
 
 const { positionals, flags } = parseArgs(process.argv.slice(2));
+
+/**
+ * **Which file to read.** Path to the `.ts` file that *declares* your props.
+ *
+ * It must be the file where `interface Foo` or `type Foo = ...` is literally
+ * written — pointing at a barrel that merely re-exports the type will fail with
+ * "not found".
+ *
+ * Given as the **first bare argument**; `--file <path>` also works.
+ *
+ * @example `npm run props -- src/TextField/types.ts WrapperTextFieldProps`
+ */
 const filePath = (flags.file as string) ?? positionals[0];
+
+/**
+ * **Which types to document.** One or more type names declared in {@link filePath}.
+ *
+ * Given as **all remaining bare arguments**, separated by spaces or commas
+ * (both forms work, and can be mixed); `--types A,B` also works. Each type gets
+ * its own table. If a name isn't found, the script lists the type names that
+ * *are* declared in the file so you can spot a typo.
+ *
+ * @example `npm run props -- src/types.ts ButtonProps IconButtonProps`
+ */
 const typeNames = (flags.types ? [String(flags.types)] : positionals.slice(1))
-  .flatMap(s => s.split(","))            // accept "A,B" or "A B"
+  .flatMap(s => s.split(","))
   .map(s => s.trim())
   .filter(Boolean);
+
+/**
+ * **Where your compiler settings live.** `--tsconfig <path>`, default `tsconfig.json`.
+ *
+ * This is what lets MUI types and your `@/...` path aliases resolve at all. If
+ * props come out as `any` or a wrapped type looks half-empty, you're almost
+ * certainly on the wrong tsconfig — point this at your real one. If the file is
+ * missing, the script warns and falls back to built-in defaults.
+ *
+ * @example `--tsconfig packages/ui/tsconfig.json`
+ */
 const tsConfigPath = (flags.tsconfig as string) ?? "tsconfig.json";
-const ownOnly = Boolean(flags.own);              // keep ONLY your own props
-const includeDom = Boolean(flags["include-dom"]); // keep aria-/DOM/event props too
-const keepTree = Boolean(flags.tree);            // include the verbose nested _tree
-const maxLen = Number(flags.maxlen ?? 200);      // collapse any prop whose rendered type exceeds this
+
+/**
+ * **Hide everything you didn't write.** `--own`, default off.
+ *
+ * Keeps only props declared in your own source, dropping all inherited ones —
+ * including the documented MUI props. Useful for reviewing just your wrapper's
+ * additions. For a Storybook table you usually want the default instead
+ * (yours + MUI, minus DOM noise).
+ */
+const ownOnly = Boolean(flags.own);
+
+/**
+ * **Stop hiding the `aria-*` flood.** `--include-dom`, default off.
+ *
+ * By default every prop inherited from `@types/react` — `aria-*`, `onCopy`,
+ * `className`, `style`, and the rest of `HTMLAttributes` — is dropped, leaving
+ * your props plus the MUI props that appear in MUI's documentation. Pass this
+ * to keep them all. Overrides {@link ownOnly}.
+ */
+const includeDom = Boolean(flags["include-dom"]);
+
+/**
+ * **Include the raw nested structure.** `--tree`, default off.
+ *
+ * Adds a verbose `_tree` field to each prop in the JSON output, holding the
+ * full recursive type description. Off by default because the flat `type` and
+ * `variants` fields are all Storybook needs; turn it on only if something
+ * downstream walks the nested shape.
+ */
+const keepTree = Boolean(flags.tree);
+
+/**
+ * **Guard against monster types.** `--maxlen <n>`, default `200` characters.
+ *
+ * Any prop whose rendered type string grows past this is collapsed back to the
+ * short name the author wrote. This is what stops types like `sx` from dumping
+ * megabytes of expanded CSS properties into your table, even for types you
+ * never thought to exclude. Lower it (`--maxlen 120`) for terser tables, raise
+ * it to let more detail through.
+ */
+const maxLen = Number(flags.maxlen ?? 200);
+
+/**
+ * **Types to show by name instead of expanding.** `--ignore A,B`, default none.
+ *
+ * Comma-separated type names added to the built-in opaque list (which already
+ * covers `ReactNode`, `SxProps`, `Theme`, `CSSProperties`, event types, refs).
+ * Use it when some type in your own kit is large or uninteresting and you'd
+ * rather see the alias than its contents.
+ *
+ * @example `--ignore CSSObject,SystemStyleObject`
+ */
 const ignoreList = (flags.ignore ? String(flags.ignore).split(",") : [])
-  .map(s => s.trim()).filter(Boolean);           // extra type names to keep abstract, e.g. --ignore Theme,CSSObject
+  .map(s => s.trim()).filter(Boolean);
+
+/**
+ * **Save the results.** `--out <path>`, default none.
+ *
+ * Writes all extracted props as JSON to this path — the input for generating
+ * Storybook `argTypes`. The console table prints either way; the JSON keeps
+ * full type strings, while the table truncates long ones for readability.
+ *
+ * @example `--out src/TextField/props.json`
+ */
 const outFile = flags.out as string | undefined;
+
+/**
+ * **How deep to recurse.** `--depth <n>`, default `6`.
+ *
+ * Nested objects and callback parameters are expanded down to primitives up to
+ * this depth; past it, a type is emitted as-is. Raise it for deeply nested
+ * config props, lower it if tables get noisy.
+ */
 const maxDepth = Number(flags.depth ?? 6);
 
+/**
+ * Human-readable help. Printed on `--help`, `-h`, or bare `help`, and also when
+ * a required argument is missing. Requires no file or type name — it is checked
+ * and exits before any file access or type resolution happens.
+ */
+const HELP = `
+Extract all props of a TypeScript type, recursively resolved, as a table.
+
+USAGE
+  npm run props -- <file.ts> <TypeName> [MoreTypes...] [options]
+
+ARGUMENTS
+  <file.ts>        File that declares the type. Must be where "interface Foo"
+                   is actually written, not a barrel that re-exports it.
+  <TypeName>       One or more type names, space- or comma-separated.
+
+OPTIONS
+  --tsconfig <p>   Compiler config to use.                  [default: tsconfig.json]
+                   Needed for MUI types and "@/" path aliases to resolve.
+  --own            Only props you declared yourself; hides all inherited ones.
+  --include-dom    Also keep aria-*, className, style and other DOM/event props.
+                   (By default these are hidden, leaving your props + MUI's
+                   documented ones.)
+  --maxlen <n>     Collapse any type longer than n chars to its short name,
+                   so types like "sx" don't dump megabytes.      [default: 200]
+  --ignore <A,B>   Extra type names to show by name instead of expanding.
+                   ReactNode, SxProps, Theme, refs and events are already hidden.
+  --depth <n>      How deep to expand nested objects and callbacks. [default: 6]
+  --tree           Add the full nested "_tree" structure to JSON output.
+  --out <path>     Write results to a JSON file. Table prints either way.
+  --help           Show this message. (also -h, or: npm run props:help)
+
+EXAMPLES
+  # Your props plus MUI's documented ones, saved for Storybook
+  npm run props -- src/TextField/types.ts WrapperTextFieldProps --out props.json
+
+  # Just your own additions, compact types
+  npm run props -- src/TextField/types.ts WrapperTextFieldProps --own --maxlen 120
+
+  # Several types at once
+  npm run props -- src/types.ts ButtonProps IconButtonProps
+`;
+
+if (flags.help || flags.h || positionals[0] === "-h" || positionals[0] === "help") {
+  console.log(HELP);
+  process.exit(0);
+}
 if (!filePath || typeNames.length === 0) {
-  console.error("Usage: npm run props -- <file.ts> <TypeName> [MoreTypes...] [--own] [--include-dom] [--tree] [--ignore A,B] [--maxlen 200] [--out props.json] [--depth 6]");
+  if (!filePath) console.error("! Missing <file.ts> — the file that declares your props type.");
+  else console.error("! Missing <TypeName> — at least one type name to extract.");
+  console.error(HELP);
   process.exit(1);
 }
 if (!fs.existsSync(filePath)) {
